@@ -16,6 +16,7 @@ categories = ["algorithms", "network-programming", "concurrency"]
 [dependencies]
 parking_lot = { version = "0.12", default-features = false, optional = true }
 tokio = { version = "1", default-features = false, features = ["time", "sync"], optional = true }
+flume = { version = "0.10", features = ["async"] }
 
 [features]
 default = ["tokio"]

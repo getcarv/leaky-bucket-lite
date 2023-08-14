@@ -32,3 +32,24 @@ async fn test_leaky_bucket() {
     assert_eq!(3, wakeups);
     assert!(duration.expect("expected measured duration") > interval * 2);
 }
+
+#[tokio::test]
+async fn test_refill() {
+    let rate_limiter = Builder::new()
+        .max(5)
+        .tokens(0)
+        .refill_interval(Duration::from_secs(5))
+        .refill_amount(1)
+        .build();
+    let begin = Instant::now();
+    // should take about 5 seconds to acquire.
+    let rate_limiter_clone = rate_limiter.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        rate_limiter_clone.refill(4).await;
+    });
+    rate_limiter.acquire(5).await;
+    let elapsed = Instant::now().duration_since(begin);
+    println!("Elapsed: {:?}", elapsed);
+    assert!((elapsed.as_secs_f64() - 5.).abs() < 0.1);
+}

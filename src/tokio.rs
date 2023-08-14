@@ -1,4 +1,5 @@
 use crate::TryAcquireError;
+use flume::{unbounded, Receiver, Sender};
 use std::sync::Arc;
 use tokio::{
     sync::{Mutex, MutexGuard},
@@ -15,6 +16,10 @@ struct LeakyBucketInner {
     refill_amount: u32,
 
     locked: Mutex<LeakyBucketInnerLocked>,
+    /// Sender for refilling the bucket.
+    refill_tx: Sender<u32>,
+    /// Receiver for refilling the bucket.
+    refill_rx: Receiver<u32>,
 }
 
 #[derive(Debug)]
@@ -27,6 +32,7 @@ struct LeakyBucketInnerLocked {
 
 impl LeakyBucketInner {
     fn new(max: u32, tokens: u32, refill_interval: Duration, refill_amount: u32) -> Self {
+        let (refill_tx, refill_rx) = unbounded();
         Self {
             max,
             refill_interval,
@@ -35,6 +41,8 @@ impl LeakyBucketInner {
                 tokens,
                 last_refill: Instant::now(),
             }),
+            refill_tx,
+            refill_rx,
         }
     }
 
@@ -71,10 +79,28 @@ impl LeakyBucketInner {
     async fn acquire(&self, amount: u32) {
         let mut locked = self.locked.lock().await;
         if let Err(target_time) = self.try_acquire_locked(amount, &mut locked) {
-            sleep_until(target_time).await;
+            loop {
+                tokio::select! {
+                    Ok(refill) = self.refill_rx.recv_async() => {
+                        locked.tokens = self.max.min(locked.tokens + refill);
+                    }
+                    _ = sleep_until(target_time) => {}
+                }
 
-            self.update_tokens(&mut locked);
-            locked.tokens -= amount;
+                self.update_tokens(&mut locked);
+                if locked.tokens >= amount {
+                    locked.tokens -= amount;
+                    return;
+                }
+            }
+        }
+    }
+
+    pub async fn refill(&self, amount: u32) {
+        if let Ok(mut locked) = self.locked.try_lock() {
+            locked.tokens += amount;
+        } else {
+            self.refill_tx.send_async(amount).await.unwrap();
         }
     }
 
@@ -220,6 +246,43 @@ impl LeakyBucket {
     #[inline]
     pub async fn acquire(&self, amount: u32) {
         self.inner.acquire(amount).await;
+    }
+
+    /// Refill the given `amount` of tokens.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use leaky_bucket_lite::LeakyBucket;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let rate_limiter = LeakyBucket::builder()
+    ///         .max(5)
+    ///         .tokens(0)
+    ///         .refill_interval(Duration::from_secs(5))
+    ///         .refill_amount(1)
+    ///         .build();
+    ///
+    ///     println!("Waiting for permit...");
+    ///     // should take about 5 seconds to acquire.
+    ///     let leaky_clone = leaky.clone();
+    ///     tokio::spawn(async move {
+    ///         tokio::time::sleep(Duration::from_secs(5)).await;
+    ///         leaky_clone.refill(4).await;
+    ///     });
+    ///     rate_limiter.acquire(5).await;
+    ///     println!("I made it!");
+    /// }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This method will panic when acquiring more tokens than the configured maximum.
+    #[inline]
+    pub async fn refill(&self, amount: u32) {
+        self.inner.refill(amount).await;
     }
 
     /// Try to acquire one token, without waiting for the internal lock.
