@@ -8,13 +8,6 @@ use tokio::{
 
 #[derive(Debug)]
 struct LeakyBucketInner {
-    /// How many tokens this bucket can hold.
-    max: u32,
-    /// Interval at which the bucket gains tokens.
-    refill_interval: Duration,
-    /// Amount of tokens gained per interval.
-    refill_amount: u32,
-
     locked: Mutex<LeakyBucketInnerLocked>,
     /// Sender for refilling the bucket.
     refill_tx: Sender<u32>,
@@ -24,6 +17,12 @@ struct LeakyBucketInner {
 
 #[derive(Debug)]
 struct LeakyBucketInnerLocked {
+    /// How many tokens this bucket can hold.
+    max: u32,
+    /// Interval at which the bucket gains tokens.
+    refill_interval: Duration,
+    /// Amount of tokens gained per interval.
+    refill_amount: u32,
     /// Current tokens in the bucket.
     tokens: u32,
     /// Last refill of the tokens.
@@ -34,10 +33,10 @@ impl LeakyBucketInner {
     fn new(max: u32, tokens: u32, refill_interval: Duration, refill_amount: u32) -> Self {
         let (refill_tx, refill_rx) = unbounded();
         Self {
-            max,
-            refill_interval,
-            refill_amount,
             locked: Mutex::new(LeakyBucketInnerLocked {
+                max,
+                refill_interval,
+                refill_amount,
                 tokens,
                 last_refill: Instant::now(),
             }),
@@ -49,45 +48,47 @@ impl LeakyBucketInner {
     /// Updates the tokens in the leaky bucket and returns the current amount
     /// of tokens in the bucket.
     #[inline]
-    fn update_tokens(&self, locked: &mut MutexGuard<'_, LeakyBucketInnerLocked>) -> u32 {
+    fn update_tokens(locked: &mut MutexGuard<'_, LeakyBucketInnerLocked>) -> u32 {
         let time_passed = Instant::now() - locked.last_refill;
+        let refill_interval = locked.refill_interval;
+        let refill_amount = locked.refill_amount;
 
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let refills_since =
-            (time_passed.as_secs_f64() / self.refill_interval.as_secs_f64()).floor() as u32;
+            (time_passed.as_secs_f64() / refill_interval.as_secs_f64()).floor() as u32;
 
-        locked.tokens += self.refill_amount * refills_since;
-        locked.last_refill += self.refill_interval * refills_since;
+        locked.tokens += refill_amount * refills_since;
+        locked.last_refill += refill_interval * refills_since;
 
-        locked.tokens = locked.tokens.min(self.max);
+        locked.tokens = locked.tokens.min(locked.max);
 
         locked.tokens
     }
 
     #[inline]
     async fn tokens(&self) -> u32 {
-        self.update_tokens(&mut self.locked.lock().await)
+        Self::update_tokens(&mut self.locked.lock().await)
     }
 
     async fn next_refill(&self) -> Instant {
         let mut locked = self.locked.lock().await;
-        self.update_tokens(&mut locked);
+        Self::update_tokens(&mut locked);
 
-        locked.last_refill + self.refill_interval
+        locked.last_refill + locked.refill_interval
     }
 
     async fn acquire(&self, amount: u32) {
         let mut locked = self.locked.lock().await;
-        if let Err(target_time) = self.try_acquire_locked(amount, &mut locked) {
+        if let Err(target_time) = Self::try_acquire_locked(amount, &mut locked) {
             loop {
                 tokio::select! {
                     Ok(refill) = self.refill_rx.recv_async() => {
-                        locked.tokens = self.max.min(locked.tokens + refill);
+                        locked.tokens = locked.max.min(locked.tokens + refill);
                     }
                     _ = sleep_until(target_time) => {}
                 }
 
-                self.update_tokens(&mut locked);
+                Self::update_tokens(&mut locked);
                 if locked.tokens >= amount {
                     locked.tokens -= amount;
                     return;
@@ -98,14 +99,14 @@ impl LeakyBucketInner {
 
     pub async fn refill(&self, amount: u32) {
         if let Ok(mut locked) = self.locked.try_lock() {
-            locked.tokens += amount;
+            locked.tokens = locked.max.min(locked.tokens + amount);
         } else {
             self.refill_tx.send_async(amount).await.unwrap();
         }
     }
 
     fn try_acquire(&self, amount: u32) -> Result<(), TryAcquireError> {
-        self.try_acquire_locked(
+        Self::try_acquire_locked(
             amount,
             &mut self
                 .locked
@@ -116,27 +117,28 @@ impl LeakyBucketInner {
     }
 
     fn try_acquire_locked(
-        &self,
         amount: u32,
         locked: &mut MutexGuard<'_, LeakyBucketInnerLocked>,
     ) -> Result<(), Instant> {
         assert!(
-            amount <= self.max,
+            amount <= locked.max,
             "Acquiring more tokens than the configured maximum is not possible"
         );
 
-        let current_tokens = self.update_tokens(locked);
+        let current_tokens = Self::update_tokens(locked);
 
         if current_tokens < amount {
             let tokens_needed = amount - current_tokens;
-            let mut refills_needed = tokens_needed / self.refill_amount;
-            let refills_needed_remainder = tokens_needed % self.refill_amount;
+            let refill_amount = locked.refill_amount;
+            let refill_interval = locked.refill_interval;
+            let mut refills_needed = tokens_needed / refill_amount;
+            let refills_needed_remainder = tokens_needed % refill_amount;
 
             if refills_needed_remainder > 0 {
                 refills_needed += 1;
             }
 
-            Err(locked.last_refill + self.refill_interval * refills_needed)
+            Err(locked.last_refill + refill_interval * refills_needed)
         } else {
             locked.tokens -= amount;
             Ok(())
@@ -169,14 +171,36 @@ impl LeakyBucket {
     }
 
     /// Get the max number of tokens this rate limiter is configured for.
-    #[must_use]
-    pub fn max(&self) -> u32 {
-        self.inner.max
+    pub async fn max(&self) -> u32 {
+        self.inner.locked.lock().await.max
     }
 
     /// Get the current number of tokens available.
     pub async fn tokens(&self) -> u32 {
         self.inner.tokens().await
+    }
+
+    /// Set the maximum number of tokens. Clamps current tokens to the new max.
+    pub async fn set_max(&self, max: u32) {
+        let mut locked = self.inner.locked.lock().await;
+        locked.max = max;
+        locked.tokens = locked.tokens.min(max);
+    }
+
+    /// Set the current number of tokens. Clamps to the configured max.
+    pub async fn set_tokens(&self, tokens: u32) {
+        let mut locked = self.inner.locked.lock().await;
+        locked.tokens = tokens.min(locked.max);
+    }
+
+    /// Set the refill amount (tokens added per interval).
+    pub async fn set_refill_amount(&self, amount: u32) {
+        self.inner.locked.lock().await.refill_amount = amount;
+    }
+
+    /// Set the refill interval.
+    pub async fn set_refill_interval(&self, interval: Duration) {
+        self.inner.locked.lock().await.refill_interval = interval;
     }
 
     /// Get the next time at which the tokens will be refilled.
@@ -267,10 +291,10 @@ impl LeakyBucket {
     ///
     ///     println!("Waiting for permit...");
     ///     // should take about 5 seconds to acquire.
-    ///     let leaky_clone = leaky.clone();
+    ///     let rate_limiter_clone = rate_limiter.clone();
     ///     tokio::spawn(async move {
     ///         tokio::time::sleep(Duration::from_secs(5)).await;
-    ///         leaky_clone.refill(4).await;
+    ///         rate_limiter_clone.refill(4).await;
     ///     });
     ///     rate_limiter.acquire(5).await;
     ///     println!("I made it!");
