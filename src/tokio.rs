@@ -193,13 +193,31 @@ impl LeakyBucket {
         locked.tokens = tokens.min(locked.max);
     }
 
+    /// Atomically set both the max and current tokens under a single lock.
+    /// Tokens are clamped to the new max.
+    pub async fn set_state(&self, max: u32, tokens: u32) {
+        let mut locked = self.inner.locked.lock().await;
+        locked.max = max;
+        locked.tokens = tokens.min(max);
+    }
+
     /// Set the refill amount (tokens added per interval).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `amount` is zero.
     pub async fn set_refill_amount(&self, amount: u32) {
+        assert!(amount > 0, "Refill amount must be greater than zero");
         self.inner.locked.lock().await.refill_amount = amount;
     }
 
     /// Set the refill interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero.
     pub async fn set_refill_interval(&self, interval: Duration) {
+        assert!(!interval.is_zero(), "Refill interval must be greater than zero");
         self.inner.locked.lock().await.refill_interval = interval;
     }
 
