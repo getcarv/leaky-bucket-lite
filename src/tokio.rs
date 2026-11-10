@@ -27,10 +27,24 @@ struct LeakyBucketInnerLocked {
     tokens: u32,
     /// Last refill of the tokens.
     last_refill: Instant,
+    first_refill_at: Option<Instant>,
+}
+
+impl LeakyBucketInnerLocked {
+    fn next_refill(&self) -> Instant {
+        self.first_refill_at
+            .unwrap_or_else(|| self.last_refill + self.refill_interval)
+    }
 }
 
 impl LeakyBucketInner {
-    fn new(max: u32, tokens: u32, refill_interval: Duration, refill_amount: u32) -> Self {
+    fn new(
+        max: u32,
+        tokens: u32,
+        refill_interval: Duration,
+        refill_amount: u32,
+        first_refill_at: Option<Instant>,
+    ) -> Self {
         let (refill_tx, refill_rx) = unbounded();
         Self {
             locked: Mutex::new(LeakyBucketInnerLocked {
@@ -39,6 +53,7 @@ impl LeakyBucketInner {
                 refill_amount,
                 tokens,
                 last_refill: Instant::now(),
+                first_refill_at,
             }),
             refill_tx,
             refill_rx,
@@ -49,7 +64,19 @@ impl LeakyBucketInner {
     /// of tokens in the bucket.
     #[inline]
     fn update_tokens(locked: &mut MutexGuard<'_, LeakyBucketInnerLocked>) -> u32 {
-        let time_passed = Instant::now() - locked.last_refill;
+        let now = Instant::now();
+        if let Some(first_refill) = locked.first_refill_at {
+            if now < first_refill {
+                return locked.tokens;
+            }
+            locked.first_refill_at = None;
+            locked.last_refill = first_refill;
+            locked.tokens = locked
+                .tokens
+                .saturating_add(locked.refill_amount)
+                .min(locked.max);
+        }
+        let time_passed = now - locked.last_refill;
         let refill_interval = locked.refill_interval;
         let refill_amount = locked.refill_amount;
 
@@ -57,7 +84,9 @@ impl LeakyBucketInner {
         let refills_since =
             (time_passed.as_secs_f64() / refill_interval.as_secs_f64()).floor() as u32;
 
-        locked.tokens += refill_amount * refills_since;
+        locked.tokens = locked
+            .tokens
+            .saturating_add(refill_amount.saturating_mul(refills_since));
         locked.last_refill += refill_interval * refills_since;
 
         locked.tokens = locked.tokens.min(locked.max);
@@ -74,7 +103,7 @@ impl LeakyBucketInner {
         let mut locked = self.locked.lock().await;
         Self::update_tokens(&mut locked);
 
-        locked.last_refill + locked.refill_interval
+        locked.next_refill()
     }
 
     async fn acquire(&self, amount: u32) {
@@ -138,7 +167,7 @@ impl LeakyBucketInner {
                 refills_needed += 1;
             }
 
-            Err(locked.last_refill + refill_interval * refills_needed)
+            Err(locked.next_refill() + refill_interval * (refills_needed - 1))
         } else {
             locked.tokens -= amount;
             Ok(())
@@ -153,12 +182,19 @@ pub struct LeakyBucket {
 }
 
 impl LeakyBucket {
-    fn new(max: u32, tokens: u32, refill_interval: Duration, refill_amount: u32) -> Self {
+    fn new(
+        max: u32,
+        tokens: u32,
+        refill_interval: Duration,
+        refill_amount: u32,
+        first_refill_at: Option<Instant>,
+    ) -> Self {
         let inner = Arc::new(LeakyBucketInner::new(
             max,
             tokens,
             refill_interval,
             refill_amount,
+            first_refill_at,
         ));
 
         Self { inner }
@@ -419,6 +455,7 @@ pub struct Builder {
     tokens: Option<u32>,
     refill_interval: Option<Duration>,
     refill_amount: Option<u32>,
+    first_refill_at: Option<Instant>,
 }
 
 impl Builder {
@@ -430,6 +467,7 @@ impl Builder {
             tokens: None,
             refill_interval: None,
             refill_amount: None,
+            first_refill_at: None,
         }
     }
 
@@ -463,6 +501,15 @@ impl Builder {
         self
     }
 
+    /// Set the deadline of the first automatic refill.
+    ///
+    /// Later refills follow the configured interval from that first refill.
+    #[must_use]
+    pub const fn first_refill_at(mut self, deadline: Instant) -> Self {
+        self.first_refill_at = Some(deadline);
+        self
+    }
+
     /// Construct a new leaky bucket.
     #[must_use]
     pub fn build(self) -> LeakyBucket {
@@ -476,7 +523,13 @@ impl Builder {
         let refill_interval = self.refill_interval.unwrap_or(DEFAULT_REFILL_INTERVAL);
         let refill_amount = self.refill_amount.unwrap_or(DEFAULT_REFILL_AMOUNT);
 
-        LeakyBucket::new(max, tokens, refill_interval, refill_amount)
+        LeakyBucket::new(
+            max,
+            tokens,
+            refill_interval,
+            refill_amount,
+            self.first_refill_at,
+        )
     }
 }
 
